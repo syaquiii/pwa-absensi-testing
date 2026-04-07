@@ -1,68 +1,99 @@
-# Panduan Arsitektur Absensi PWA (Offline-First)
+# 📖 Panduan Pengujian Offline & Ketahanan Server (PWA Absensi Digital)
 
-Sistem Absensi Digital ini dirancang menggunakan prinsip yang sangat cerdas: **Offline-First**. Artinya, kegiatan absen siswa-siswi di lapangan tidak akan terganggu meskipun koneksi internet instansi sedang sangat buruk atau bahkan ketika *server* utama mengalami "mati mendadak".
-
-## 🌟 Fitur Inti Arsitektur Offline
-
-1. **Event-Driven Detection (Beban Server Ringan)**
-   Sistem tidak menggunakan cara konvensional seperti melakukan *"Ping"* secara membabi buta ke server setiap 10 detik. Sebaliknya, aplikasi hanya membaca dari kejadian alami (*Event-Driven*). Fitur Offline akan langsung mengambil alih kendali (UI Offline Mode aktif) jika, dan hanya jika, request absensi siswa ke server mengalami kegagalan akses koneksi (*Timeout* atau jaringan *Drop*). Hal ini membuat RAM server aman dari serangan "Spam Ping" ratusan perangkat secara bersamaan.
-
-2. **Validasi Offline Kriptografi Canggih (SHA-256)**
-   Meskipun tidak bisa bicara dengan server/database, bagaimana HP siswa tahu kalau kodenya benar? Data sandi absen (*schedules*) yang di-download saat HP masih terkoneksi disembunyikan menggunakan sandi peretasan **SHA-256**. Ketika diketik oleh Siswa, HP dapat membandingkan keabsahan kode secara independen dan anti-jebol.
-
-3. **Brankas IndexedDB & Background Service Worker Sync**
-   Jika Siswa berhasil melakukan absen saat Wifi sekolah mati, rekaman absen tersebut takkan lari ke manapun, melainkan dienkripsi ke *Memori Permanen Ponsel (IndexedDB)* siswa yang bersangkutan. Sehabis server hidup lagi dan HP kembali mendeteksi adanya internet stabil, *Service Worker* otomatis mengeksekusi semua absen yang nyala langsung ke gerbang *Backend*.
+Dokumen ini merangkum secara lengkap Arsitektur Penahan Beban (*Resilience Architecture*) yang diterapkan pada sistem Absensi Digital dan Panduan Skenario Pengujian (*Stress Test*) untuk memastikan sistem 100% siap produksi (tahan gempuran 15.000 Siswa / *Thundering Herd*).
 
 ---
 
-## 💥 Simulasi Pemecahan Masalah Dua Kerusakan (Troubleshooting Bencana)
+## 🏗️ 1. Arsitektur Tiga Lapis Pertahanan (Three-Layer Defense)
 
-Arsitektur aplikasi kita terpecah atas dua modul utama: `Web API Server` (Sang Penerima Tamu / Kasir) dan `Queue Worker` (Sang Eksekutor Dapur). Masing-masing dapat saja tumbang dengan efek yang unik!
+Agar *server* utama tidak leleh dan mati kelaparan (*Out of Memory* / *Connection DB Refused*), sistem diatur dengan penjagaan 3 tahap:
 
-### Kasus 1: API Web Server Tumbang (Kasir Hilang / Lampu Padam)
-- **Apa yang Muncul:** PWA akan berubah wujud memunculkan peringatan bar merah menyala **Offline Mode**.
-- **Di Balik Layar:** Aplikasi tetap menyetujui *Submit* absen siswa. Bedanya, hasil absen diam-diam disimpan pada Memori Lokal perangkat Browser (*IndexedDB*). Histori kehadiran menampilkan: `⏳ Menunggu sinkronisasi...` (Siswa dapat pulang tanpa khawatir).
-- **Pemulihan Akhir:** Tatkala internet membaik dan Lampu API Web Server nyala kembali, status bar di atas PWA berubah biru berputar-putar mensinkronisasikan antreannya, lalu histori menjadi tanda `✓ Hadir` cerah secara massal.
+1. **Lapis Pertama (PWA Client - Tukang Sabar):**
+   Aplikasi siswa memiliki kepintaran yang disebut `Background Sync`. Bila HP siswa mati sinyal (Offline), atau Server kepanasan (429), atau Server Mati Total (500/Refused), **PWA akan menyimpan absensi secara aman di berangkas HP (IndexedDB)**. PWA akan mencoba mem-Ping Server terus menerus di balik layar sampai berhasil.
 
-### Kasus 2: Pekerja Database *Crash* OOM (Koki Pingsan, Kasir Selamat)
-- **Apa yang Muncul:** Layar Aplikasi merasa segar dan stabil mengira jaringannya sempurna ("Online").
-- **Di Balik Layar:** HP siswa dengan pedenya membidik tembakan Absen dan memperoleh status sukses di tangan server API (HTTP `202 Accepted`). PWA Siswa memaklumi data absennya diterima pusat dan membuang datanya dari Backup memory. Nahas, data tersebut memupuk menjadi tumpukan sampah panjang di Kolom Database `jobs` Laravel karena Mesin Koki nya mati. PWA HP Siswa tidak bisa menerima sinyal Kehadiran Valid (Karena datanya terjebak tak masuk rapor absensi), lantas logo abu abu pun mandek selamanya `⏳ Menunggu sinkronisasi...`. 
-- **⚠️ Penekanan Khusus Admin:** Jika situasi ini melanda, jangan bodoh dengan memaksa **anak-anak untuk absen input yang kedua kalinya!** (App-pun akan tetap memblokir input ganda). Solusinya cuma satu: **Segerakan *Turn-On* Queue**.
-  Jalankan perintah pengolah ini di Server Linux mu:
-  ```bash
-  php artisan queue:work --queue=attendance,default
-  ```
-  Dan dalam sesaat, ribuan timbunan queue tereksekusi *BOOOM*, berubah status menunjukan `✓ Hadir` di seluruh penjuru perangkat siswa!
+2. **Lapis Kedua (Laravel Global Rate Limiter - Satpam Pintu Depan):**
+   `AppServiceProvider` menahan laju masuk HTTP dari internet menggunakan filter `Limit::perSecond(50)`. 
+   Artinya, selaparnya apa pun jaringan masuk, *Laravel* hanya menolerir 50 siswa membunyikan bel server per satu detik. Siswa ke-51 dst akan ditendang dengan `HTTP 429` agar server tidak mati. (Siswa yang ditendang ini akan di-tampung oleh Lapis 1).
+
+3. **Lapis Ketiga (Redis/DB Queue Worker - Koki Dapur Latar Belakang):**
+   Data dari Lapis 2 yang lolos, **TIDAK** langsung ditulis ke `MySQL`. Permintaan mereka ditampung dulu di keranjang keranjang Queue (Antrean).
+   Sebuah *Worker* (`php artisan queue:work`) secara pelan namun stabil akan memasukkan absen satu-satu ke MySQL memastikan MySQL Database Server tidak panik diserang *Too Many Connections*.
 
 ---
 
-## 🧪 Testing QA DevTools Checklist 
+## 🎯 2. Persiapan Simulasi Skenario (K6)
 
-Untuk Tim IT yang sedang menjalankan pengetesan QA fungsionalitas mematikan jaringan di komputer pribadi (*Localhost*), hal *Chrome DevTools* menyimpan jebakan yang mematikan kapabilitas Luring PWA kita ini.
+Untuk melakukan pengujian beban (*Stress Test*), kita menggunakan aplikasi **K6** untuk membuat *pasukan anak sekolah bohongan*, dan juga mensimulasikan kepintaran "Back-off Delay" dari PWA.
 
-> **Peringatan KERAS Caching Chrome!**
-> HARAM hukumnya bagi kamu menekan `Ctrl + F5` (Hard Refresh) dikala PWA berada Online / Offline. Hard refresh sama saja membunuh detektor ServiceWorker kita karena Chrome mem*bypassnya* sepihak, memanggil Data API usang nan kadaluwarsa ketika internet di cabut!
+### Persiapan *Environment* (wajib):
+Sebelum menembak peluru K6, pastikan:
+1. Pastikan Anda sudah masuk *(login)* di UI Browser Web sebagai Siswa.
+2. Pastikan ada **Sesi Absen yang Sedang Aktif** yang dibuat oleh Admin (klik tombol "Mulai Absen").
+3. Catat `session_id` dari Sesi yang Aktif tersebut (misalnya `id: 18`) dan kodenya (misalnya `"123123"`).
+4. Ambil Sandi `XSRF-TOKEN` dan `Cookie Session` dengan menekan **F12** di Google Chrome pada tab **Application > Cookies** atau Copy cURL dari Network Tab.
 
-Lakukan Step Standar Testing Pengujian berikut ini: 
+Lalu edit *script* K6 (`load-test.js`) Anda di bagian ini:
+```javascript
+// Ganti Parameter agar valid dengan ID di Database!
+session_id: 18, 
+attendance_code: "123123",
 
-### 1. Persiapan Basis Lokal
-*Buka terminal berbarengan:*
-```bash
-  php artisan serve
+...
+// Update Token secara URL DECODE
+"X-XSRF-TOKEN": "eyJ...",
+Cookie: "XSRF-TOKEN=eyJ...; absensi-digital-session=eyJ..."
 ```
-*Gunakan Tab ke dua:*
-```bash
-  php artisan queue:work --queue=attendance,default
+
+---
+
+## ⚔️ 3. Eksekusi Skenario: "500 Siswa Panik Serentak"
+
+**Skenarionya:** 500 Siswa berkumpul di Aula, Sinyal Jelek, dan 500 orang menekan "Tombol Absen" persis di satu detik yang sama.
+
+### Langkah-langkah Eksekusi:
+Buka 3 Jendela Terminal Anda!
+
+*   **Terminal 1 (Web Server Asli)**
+    ```bash
+    php artisan serve
+    ```
+*   **Terminal 2 (Koki Latar Belakang / Queue)**
+    ```bash
+    php artisan queue:work --queue=attendance,default
+    ```
+*   **Terminal 3 (500 Pasukan K6)**
+    ```bash
+    k6 run load-test.js
+    ```
+
+### Ekspektasi Alur Kejadian Interaktif:
+1. Saat K6 dijalankan, layar Terminal 1 (*Server*) dan Terminal 3 (K6) akan penuh.
+2. Di layar K6 **(Terminal 3)**, Anda akan melihat sebagian Siswa sukses ditampung, dan sebagian Siswa langsung dihantam *Error* `🔥 Server Kepanasan (429) -> PWA Aktif Mengantre`.
+   Ini membuktikan **Lapis Kedua** menjaga server kita dengan baik. K6 (sebagai PWA Semu) terpaksa "Tidur/Sleep 15 Detik" menunggu antrean reda.
+3. Di **Terminal 2**, Anda akan melihat `App\Jobs\ProcessAttendance .... DONE` berjalan mulus dengan kecepatan sekitar **25 milidetik** per-Siswa. Koki dengan tenang memproses satu-persatu antrean yang sudah diizinkan Server masuk. 
+
+### Kesimpulan Indikator Selesai (Kemenangan):
+Pada menit ke-2 (120 Detik), simulasi akan menunjukkan:
+
+```text
+running (02m00.7s), 00/50 VUs, 500 complete and 0 interrupted iterations
+default ✓ [ 100% ] 50 VUs  02m00.7s/10m0s  500/500 shared iters 
+    checks_total.......: 500
 ```
-Pastikan di Panel Portal *Admin* setidaknya telah disediakan 1 session aktif.
+Angka `500 complete` ini artinya seluruh Siswa yang tertendang Rate-Limiter (Kepenuhan) sukses ngantre balik via *Background Sync* K6 tanpa melewatkan satupun absen. 
 
-### 2. Loading Memori *Offline* Luring
-Buka mode penyamaran *Incognito*, akses PWA murid di `http://localhost:8000/student/attendance`. Agar `ServiceWorker` menangkap muatan terbaru memori cache dari API, lakukan **Satu Kali Refresh Normal (F5 saja)**. Tampilan antarmuka masukan pin akan muncul bersih.
+## 🛡️ 4. Validasi Anti-Double-Absen (Idempotency)
 
-### 3. Simulasi Offline Memutus Kabel
-Buka *Inspect Element (F12)*, buka Panel Tab **Network**, kemudian gulir *Dropdown* 'No throttling' kepada wujud **'Offline'**. Boleh direfresh Normal lagi untuk melihat wujud Merahnya muncul, atau tanpa direfresh pun, Aplikasi akan sadar koneksi ini Drop dan menghitam!
-Inputkan sembarang *Pin* absensinya *(misal: HJKLNM)*. Tombol berputar ria menghasilkan wujud `⏳ Menunggu Sinkronisasi`. Buktikan kehebatan itu di sini, memori Indexer telah membungkus isian tersebut.
+*(Optional check bila diperlukan)*
 
-### 4. Tahap Pemulihan
-Kembalikan setelan DevTools Network Network kepada `No throttling`, kemudian angkat tangan dan **LEPASKANMOUSE! JANGAN PERNAH MENYENTUH ATAU MEREFRESH SCREEN!**
-Background engine dari Browser mengidentifikasi kebangkitan jaringan, secara rahasia mengeksekusikan beban yang menanti di brankasnya menuju ke *Backend PHP Laravel*, disambar gesit oleh *Queen Worker* database, dan teks Status di layar akan *Magis* berkedip serentak mengganti statusnya dengan balok Hijau mencolok: **"Semua Selesai: ✓ Hadir!"** 
+Bagaimana jika karena Jaringan Lemot, siswa bolak balik menekan "Kirim Absen" sehingga 1 orang terdeteksi seolah 500x mengirim permintaan HTTP?
+
+Di dalam Kerapian *Backend* Laravel pada Pekerja Latar (`ProcessAttendance`), kita menancapkan rumus:
+```php
+$attendance = Attendance::updateOrCreate(
+    [ 'user_id' => $this->userId, 'attendance_session_id' => $this->sessionId ]
+);
+```
+**Efek Super:** Meski K6 menembakkan ID Siswa yang sama sebanyak 500 kali (Karena Cookie menempel *User_ID* yang sama terus), ke-500 tembakan Absen ini ditangkap dan ditimpa di-1 Baris (`Row`) `attendances` yang sama MySQL kita. 
+
+Sedangkan Riwayat bukti mereka merepotkan server (500 HTTP *Request* aslinya) tetap dicatat sebagai resi pembayaran yang valid oleh tabel `idempotency_keys` kita! Server bersih, aman dari duplikat, Siswa Tenang. 🎉

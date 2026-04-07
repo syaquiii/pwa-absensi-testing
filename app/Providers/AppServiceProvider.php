@@ -27,7 +27,7 @@ class AppServiceProvider extends ServiceProvider
         // to 30/s regardless of how many students are hitting the endpoint.
         // Safely below the server's 40 req/s crash threshold.
         RateLimiter::for('attendance-sync', function (Request $request) {
-            return Limit::perSecond(30)
+            return Limit::perSecond(50)
                         ->by('global-attendance-sync')
                         ->response(function () {
                             return response()->json([

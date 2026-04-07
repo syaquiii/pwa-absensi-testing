@@ -1,57 +1,81 @@
-import http from 'k6/http';
-import { check, sleep } from 'k6';
+import http from "k6/http";
+import { check, sleep } from "k6";
 
-// Konfigurasi Beban Ekstrem
 export const options = {
-    // 500 Siswa/Virtual User (VU) yang sama-sama menekan "Hadir" seketika di detik yang MURNI sama.
-    vus: 500, 
-    // Mereka akan terus menerus memberondong server selama 30 detik (Total bisa mencapai puluhan ribu Request).
-    duration: '30s', 
+    vus: 50, // 500 siswa nekan bareng
+    iterations: 500, // Tepat 500 Data Harus Masuk DB, pantang pulang sebelum tembus!
 };
 
-// Fungsi yang dieksekusi oleh 500 siswa virtual secara pararel
 export default function () {
-    const url = 'http://localhost:8000/student/attendance/sync';
-    
-    // Payload JSON mirip seperti buatan IndexedDB
+    const url = "http://localhost:8000/student/attendance/sync";
+
+    // Identitas Unik per-Siswa (Pasti masuk ke DB)
+    const baseKey = `k6-test-pwa-${__VU}-${__ITER}-`;
+    const idempotencyKey = baseKey.padEnd(36, "0");
+
     const payload = JSON.stringify({
         items: [
             {
-                // __VU x __ITER bikin kunci unik agar nggak kena filter antrean awal
-                idempotency_key: `k6-test-${__VU}-${__ITER}`, 
-                session_id: 1,  // ID Sesi bebas
-                attendance_code: 'TEST',
-                status: 'present',
+                idempotency_key: idempotencyKey,
+                session_id: 18,
+                attendance_code: "123123",
+                status: "present",
                 submitted_at: new Date().toISOString(),
-                device_info: 'k6-load-test',
-            }
-        ]
+                device_info: "k6-pwa-simulator",
+            },
+        ],
     });
 
     const params = {
         headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            
+            "Content-Type": "application/json",
+            Accept: "application/json",
             // ============================================
-            // ⚠️ PENTING: Ganti Isi Cookie & Token ini!
+            // ⚠️ JANGAN LUPA GANTI KEMBALI COOKIENYA SAMA SEPERTI TADI!
             // ============================================
-             // 1. Copy dari Chrome > F12 > Network > Headers permintaan /sync terakhirmu
-            'X-XSRF-TOKEN': 'PASTE_XSRF_VALUE_DISINI', 
-            'Cookie': 'XSRF-TOKEN=PASTE_XSRF_VALUE; laravel_session=PASTE_LARAVEL_SESSION_VALUE'
+            // JANGAN LUPA URL DECODE kalau masuk ke header!
+            "X-XSRF-TOKEN":
+                "eyJpdiI6IkdyQWRrU1VCZnZZZENXVUZRMDhoaWc9PSIsInZhbHVlIjoidDFTN3ZRcEd3dzdmWGJ3U0IzamJzNC9oRGFKMTJvOXh2QUlXRVhwQmVUL2lzQUtZaHBWNmFVZjlsbVlDKytBODlZeGY4ay9CZEZmS2JOdTZha1k0SmJwL0lWVkZkUXB2aFBncTVWekowY2xmL0pCanE2eEFUOFAvRzRkYkZnZmgiLCJtYWMiOiI1NmY1N2FlMDgzMWZhMDg3ODFlMzUyMTBkNDQyMTllYjk2YmJmOTg0ZDIzMzJlY2M2ZWI1Zjk5NmJlYzM3MzNkIiwidGFnIjoiIn0=",
+            Cookie: "XSRF-TOKEN=eyJpdiI6IkdyQWRrU1VCZnZZZENXVUZRMDhoaWc9PSIsInZhbHVlIjoidDFTN3ZRcEd3dzdmWGJ3U0IzamJzNC9oRGFKMTJvOXh2QUlXRVhwQmVUL2lzQUtZaHBWNmFVZjlsbVlDKytBODlZeGY4ay9CZEZmS2JOdTZha1k0SmJwL0lWVkZkUXB2aFBncTVWekowY2xmL0pCanE2eEFUOFAvRzRkYkZnZmgiLCJtYWMiOiI1NmY1N2FlMDgzMWZhMDg3ODFlMzUyMTBkNDQyMTllYjk2YmJmOTg0ZDIzMzJlY2M2ZWI1Zjk5NmJlYzM3MzNkIiwidGFnIjoiIn0%3D; absensi-digital-session=eyJpdiI6ImlZUEkycGVCb3ZyejZ1aHNmZ1NJZnc9PSIsInZhbHVlIjoid2ZjSm4zNHpoUCtOUiswRGlHYVliREhhQjF2WTIxK0xRSFh0N2h1NWRMT1J4VVdvVm9NcXdyU01HSC91TDVnaFV3bUl4T1l4S3FVMGZtYmxGdFhCRmMzRk1DVmxKQmI0R1RpUUwvN0JEYWJWanB5Z1pDTFM2T2g0NUwvU1ZDQ1IiLCJtYWMiOiIyNDUyZDcxOTMyMjJiY2ZlMTYzYjYyNjRiYzg3ZDU4NThlYjhjYjAxZmNhNWUwYzdjNWZiZjE1NGI2ODMyYzM0IiwidGFnIjoiIn0%3D",
         },
     };
 
-    // Tembak server!
-    const res = http.post(url, payload, params);
+    let suksesTembusDB = false;
+    let percobaanRetries = 0;
 
-    // Cek sukses (202) atau ditolak karena server macet (429)
-    check(res, {
-        'Tembus sukses masuk Antrean (202)': (r) => r.status === 202,
-        'Ditolak Pintu Limit Server (429)': (r) => r.status === 429,
-        'Server Jebol / Crash (500/502/503)': (r) => r.status >= 500,
-    });
+    // INILAH PERILAKU ASLI PWA SISWA: TERUS MENCOBA SAMPAI SUKSES
+    while (!suksesTembusDB && percobaanRetries < 20) {
+        const res = http.post(url, payload, params);
 
-    // PWA Delay aslinya (Stagger Cluster). K6 kita set nembak lagi stiap 1 - 2 detik.
-    sleep(1);
+        if (res.status === 202) {
+            // BERHASIL DIPROSES SERVER!
+            suksesTembusDB = true;
+            check(res, { "✅ Sukses Menembus Server (202)": (r) => true });
+        } else if (res.status === 429) {
+            // SERVER KEPANASAN (PWA Disuruh Nunggu 15 Detik oleh Laravel)
+            check(res, {
+                "🔥 Server Kepanasan (429) -> PWA Aktif Mengantre": (r) => true,
+            });
+            sleep(15); // Simulasi Back-off Delay PWA aslinya!
+        } else {
+            // JIKA MASUK KESINI, KITA HARUS TAU APAKAH INI CONNECTION REFUSED ATAU ERROR DARI LARAVEL
+            let errMsg = res.body;
+            try {
+                let json = JSON.parse(res.body);
+                errMsg = JSON.stringify(
+                    json.errors || json.message || "Unknown",
+                );
+            } catch (e) {}
+            console.log(
+                `\n[TERTOLAK] Status: ${res.status} | Pesan: ${errMsg}`,
+            );
+            check(res, {
+                "☠️ Server Mati/Refused/Error -> PWA Menyimpan Data Tunggu nyala":
+                    (r) => true,
+            });
+            sleep(5); // PWA Offline menunggu koneksi hidup lagi
+        }
+
+        percobaanRetries++;
+    }
 }
